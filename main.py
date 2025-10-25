@@ -6,19 +6,22 @@ from web3 import Web3
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
 from datetime import datetime, timedelta
-import json
 import sqlite3
 from enum import Enum
+import requests
 
-# Fix for Replit / Jupyter nested event loops
-nest_asyncio.apply()
+# Apply nest_asyncio for environments that need it
+try:
+    nest_asyncio.apply()
+except Exception as e:
+    print(f"nest_asyncio not available: {e}")
 
 # --- Load environment variables ---
-BOT_TOKEN = os.environ['BOT_TOKEN']
-POLYGON_TEST_PRIVATE_KEY = os.environ['BOT_PRIVATE_KEY_TESTNET']
-POLYGON_MAIN_PRIVATE_KEY = os.environ['BOT_PRIVATE_KEY_MAINNET']
-RPC_POLYGON_TEST = os.environ['RPC_URL_TESTNET']
-RPC_POLYGON_MAIN = os.environ['RPC_URL_MAINNET']
+BOT_TOKEN = os.environ.get('BOT_TOKEN', 'your-bot-token-here')
+POLYGON_TEST_PRIVATE_KEY = os.environ.get('BOT_PRIVATE_KEY_TESTNET', 'your-testnet-private-key')
+POLYGON_MAIN_PRIVATE_KEY = os.environ.get('BOT_PRIVATE_KEY_MAINNET', 'your-mainnet-private-key')
+RPC_POLYGON_TEST = os.environ.get('RPC_URL_TESTNET', 'https://rpc-mumbai.maticvigil.com')
+RPC_POLYGON_MAIN = os.environ.get('RPC_URL_MAINNET', 'https://polygon-rpc.com')
 
 # --- Configuration ---
 class EscrowState(Enum):
@@ -32,17 +35,12 @@ class EscrowState(Enum):
 # Token addresses
 TOKENS = {
     'MATIC': {
-        'testnet': None,  # Native token
+        'testnet': None,
         'mainnet': None,
         'decimals': 18
     },
     'USDT': {
-        'testnet': '0x3813e82e6f7098b9583FC0F33a962D02018B6803',  # Mumbai USDT
-        'mainnet': '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174',  # Polygon USDT
-        'decimals': 6
-    },
-    'USDC': {
-        'testnet': '0x0FA8781a83E46826621b3BC094Ea2A0212e71B23',  # Mumbai USDC
+        'testnet': '0x3813e82e6f7098b9583FC0F33a962D02018B6803',
         'mainnet': '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174',
         'decimals': 6
     }
@@ -61,30 +59,27 @@ class EscrowDB:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat_id INTEGER,
                 buyer_id INTEGER,
-                seller_id INTEGER,
+                seller_username TEXT,
                 amount REAL,
                 token TEXT,
                 network TEXT,
                 state TEXT,
                 created_at TIMESTAMP,
                 expires_at TIMESTAMP,
-                buyer_address TEXT,
-                seller_address TEXT,
-                tx_hash TEXT,
-                dispute_reason TEXT,
-                admin_notified BOOLEAN DEFAULT FALSE
+                deposit_address TEXT,
+                buyer_address TEXT
             )
         ''')
         self.conn.commit()
     
-    def create_escrow(self, chat_id, buyer_id, seller_id, amount, token, network, hours=24):
+    def create_escrow(self, chat_id, buyer_id, seller_username, amount, token, network, hours=24):
         cursor = self.conn.cursor()
         expires_at = datetime.now() + timedelta(hours=hours)
         cursor.execute('''
             INSERT INTO escrows 
-            (chat_id, buyer_id, seller_id, amount, token, network, state, created_at, expires_at)
+            (chat_id, buyer_id, seller_username, amount, token, network, state, created_at, expires_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (chat_id, buyer_id, seller_id, amount, token, network, EscrowState.CREATED.value, datetime.now(), expires_at))
+        ''', (chat_id, buyer_id, seller_username, amount, token, network, EscrowState.CREATED.value, datetime.now(), expires_at))
         self.conn.commit()
         return cursor.lastrowid
     
@@ -93,22 +88,19 @@ class EscrowDB:
         cursor.execute('SELECT * FROM escrows WHERE id = ?', (escrow_id,))
         return cursor.fetchone()
     
-    def update_escrow_state(self, escrow_id, state, tx_hash=None):
+    def update_escrow_state(self, escrow_id, state):
         cursor = self.conn.cursor()
-        if tx_hash:
-            cursor.execute('UPDATE escrows SET state = ?, tx_hash = ? WHERE id = ?', (state.value, tx_hash, escrow_id))
-        else:
-            cursor.execute('UPDATE escrows SET state = ? WHERE id = ?', (state.value, escrow_id))
+        cursor.execute('UPDATE escrows SET state = ? WHERE id = ?', (state.value, escrow_id))
         self.conn.commit()
     
-    def set_buyer_address(self, escrow_id, address):
+    def set_deposit_address(self, escrow_id, address):
         cursor = self.conn.cursor()
-        cursor.execute('UPDATE escrows SET buyer_address = ? WHERE id = ?', (address, escrow_id))
+        cursor.execute('UPDATE escrows SET deposit_address = ? WHERE id = ?', (address, escrow_id))
         self.conn.commit()
     
     def get_user_escrows(self, user_id):
         cursor = self.conn.cursor()
-        cursor.execute('SELECT * FROM escrows WHERE buyer_id = ? OR seller_id = ? ORDER BY created_at DESC', (user_id, user_id))
+        cursor.execute('SELECT * FROM escrows WHERE buyer_id = ? ORDER BY created_at DESC', (user_id,))
         return cursor.fetchall()
 
 # --- Setup Logging ---
@@ -118,45 +110,83 @@ logging.basicConfig(
 )
 logger = logging.getLogger("escrow_bot")
 
-# --- Web3 Setup ---
-w3_test = Web3(Web3.HTTPProvider(RPC_POLYGON_TEST))
-w3_main = Web3(Web3.HTTPProvider(RPC_POLYGON_MAIN))
+# --- Web3 Setup with Better Error Handling ---
+def setup_web3_connection(rpc_url, network_name):
+    """Setup Web3 connection with proper error handling and fallbacks"""
+    try:
+        # Test the connection first
+        response = requests.post(rpc_url, json={
+            "jsonrpc": "2.0",
+            "method": "eth_blockNumber",
+            "params": [],
+            "id": 1
+        }, timeout=10)
+        
+        if response.status_code == 200:
+            w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={'timeout': 60}))
+            if w3.is_connected():
+                logger.info(f"✅ Connected to {network_name}")
+                return w3
+            else:
+                logger.warning(f"⚠️ Web3 not connected to {network_name}, but HTTP connection works")
+                return w3
+        else:
+            logger.warning(f"❌ RPC endpoint not accessible: {response.status_code}")
+            return None
+    except Exception as e:
+        logger.warning(f"❌ Failed to connect to {network_name}: {e}")
+        # Try fallback RPCs
+        fallback_rpcs = {
+            'testnet': [
+                'https://polygon-mumbai-bor.publicnode.com',
+                'https://rpc.ankr.com/polygon_mumbai',
+                'https://polygon-testnet.public.blastapi.io'
+            ],
+            'mainnet': [
+                'https://polygon-bor.publicnode.com',
+                'https://rpc.ankr.com/polygon',
+                'https://polygon-rpc.com'
+            ]
+        }
+        
+        network_type = 'testnet' if 'mumbai' in rpc_url or 'test' in rpc_url else 'mainnet'
+        for fallback_rpc in fallback_rpcs[network_type]:
+            try:
+                logger.info(f"Trying fallback RPC: {fallback_rpc}")
+                w3 = Web3(Web3.HTTPProvider(fallback_rpc, request_kwargs={'timeout': 60}))
+                if w3.is_connected():
+                    logger.info(f"✅ Connected to {network_name} via fallback: {fallback_rpc}")
+                    return w3
+            except Exception as fallback_error:
+                logger.warning(f"Fallback RPC failed: {fallback_error}")
+                continue
+        
+        logger.error(f"❌ All RPC connections failed for {network_name}")
+        return None
 
-account_test = w3_test.eth.account.from_key(POLYGON_TEST_PRIVATE_KEY)
-account_main = w3_main.eth.account.from_key(POLYGON_MAIN_PRIVATE_KEY)
+# Initialize Web3 connections
+w3_test = setup_web3_connection(RPC_POLYGON_TEST, "Polygon Testnet")
+w3_main = setup_web3_connection(RPC_POLYGON_MAIN, "Polygon Mainnet")
+
+# Initialize accounts only if Web3 is connected
+account_test = None
+account_main = None
+
+if w3_test:
+    try:
+        account_test = w3_test.eth.account.from_key(POLYGON_TEST_PRIVATE_KEY)
+        logger.info(f"🤖 Testnet Bot address: {account_test.address}")
+    except Exception as e:
+        logger.error(f"❌ Failed to create testnet account: {e}")
+
+if w3_main:
+    try:
+        account_main = w3_main.eth.account.from_key(POLYGON_MAIN_PRIVATE_KEY)
+        logger.info(f"🤖 Mainnet Bot address: {account_main.address}")
+    except Exception as e:
+        logger.error(f"❌ Failed to create mainnet account: {e}")
 
 db = EscrowDB()
-
-# --- ERC20 ABI (simplified) ---
-ERC20_ABI = [
-    {
-        "constant": True,
-        "inputs": [{"name": "_owner", "type": "address"}],
-        "name": "balanceOf",
-        "outputs": [{"name": "balance", "type": "uint256"}],
-        "type": "function"
-    },
-    {
-        "constant": False,
-        "inputs": [
-            {"name": "_to", "type": "address"},
-            {"name": "_value", "type": "uint256"}
-        ],
-        "name": "transfer",
-        "outputs": [{"name": "", "type": "bool"}],
-        "type": "function"
-    },
-    {
-        "anonymous": False,
-        "inputs": [
-            {"indexed": True, "name": "from", "type": "address"},
-            {"indexed": True, "name": "to", "type": "address"},
-            {"indexed": False, "name": "value", "type": "uint256"}
-        ],
-        "name": "Transfer",
-        "type": "event"
-    }
-]
 
 # --- Telegram Bot Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -169,26 +199,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(
         "🤖 **Intelligent Escrow Bot**\n\n"
-        "I automate secure transactions between buyers and sellers with:\n"
-        "• Auto-detection of payments\n"
-        "• Dispute resolution system\n"
-        "• Multi-token support (MATIC, USDT, USDC)\n"
-        "• Smart contract integration\n\n"
+        "I automate secure transactions between buyers and sellers!\n\n"
         "Choose an option below:",
         reply_markup=reply_markup,
         parse_mode='Markdown'
     )
 
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle button callbacks"""
     query = update.callback_query
-    await query.answer()
+    await query.answer()  # Important: acknowledge the callback
     
     data = query.data
+    logger.info(f"Button pressed: {data} by user {query.from_user.id}")
     
     if data == "create_escrow":
         await create_escrow_start(query, context)
     elif data == "my_escrows":
         await show_my_escrows(query, context)
+    elif data == "help":
+        await show_help(query, context)
+    elif data == "back_to_main":
+        await back_to_main(query, context)
     elif data.startswith("escrow_detail_"):
         escrow_id = int(data.split("_")[2])
         await show_escrow_detail(query, context, escrow_id)
@@ -200,59 +232,109 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await start_dispute(query, context, escrow_id)
 
 async def create_escrow_start(query, context):
+    """Start escrow creation process"""
+    try:
+        await query.edit_message_text(
+            "🛍 **Create New Escrow**\n\n"
+            "Please use the command:\n"
+            "`/create @seller 0.1 MATIC testnet`\n\n"
+            "Format:\n"
+            "• `/create @username amount token network`\n"
+            "• Token: MATIC or USDT\n"
+            "• Network: testnet or mainnet\n\n"
+            "Example:\n"
+            "`/create @john 0.1 MATIC testnet`",
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.error(f"Error in create_escrow_start: {e}")
+        await query.message.reply_text("Error processing your request. Please try again.")
+
+async def show_help(query, context):
+    """Show help information"""
     await query.edit_message_text(
-        "🛍 **Create New Escrow**\n\n"
-        "Please provide details in this format:\n"
-        "`/create @seller_username 100 USDT testnet 24`\n\n"
-        "Where:\n"
-        "• @seller_username - Seller's Telegram username\n"
-        "• 100 - Amount\n"
-        "• USDT - Token (MATIC, USDT, USDC)\n"
-        "• testnet - Network (testnet/mainnet)\n"
-        "• 24 - Hours to complete (optional)\n\n"
-        "Example: `/create @john 50 MATIC testnet 24`",
+        "🤖 **Escrow Bot Help**\n\n"
+        "**Commands:**\n"
+        "• /start - Start the bot\n"
+        "• /create - Create new escrow\n"
+        "• /status - Check bot status\n\n"
+        "**How it works:**\n"
+        "1. Create escrow with seller\n"
+        "2. Send crypto to deposit address\n"
+        "3. Seller confirms receipt\n"
+        "4. Funds released automatically\n\n"
+        "Supported: MATIC, USDT on Polygon",
+        parse_mode='Markdown'
+    )
+
+async def back_to_main(query, context):
+    """Return to main menu"""
+    keyboard = [
+        [InlineKeyboardButton("🛍 Create Escrow", callback_data="create_escrow")],
+        [InlineKeyboardButton("📊 My Escrows", callback_data="my_escrows")],
+        [InlineKeyboardButton("ℹ️ Help", callback_data="help")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        "🤖 **Intelligent Escrow Bot**\n\n"
+        "Choose an option below:",
+        reply_markup=reply_markup,
         parse_mode='Markdown'
     )
 
 async def create_escrow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /create command"""
     try:
         if len(context.args) < 4:
-            await update.message.reply_text("❌ Invalid format. Use: `/create @seller amount token network [hours]`", parse_mode='Markdown')
+            await update.message.reply_text(
+                "❌ **Invalid format!**\n\n"
+                "Use: `/create @seller amount token network`\n\n"
+                "Example:\n"
+                "`/create @john 0.1 MATIC testnet`",
+                parse_mode='Markdown'
+            )
             return
         
         seller_username = context.args[0]
         amount = float(context.args[1])
         token = context.args[2].upper()
         network = context.args[3].lower()
-        hours = int(context.args[4]) if len(context.args) > 4 else 24
         
+        # Validation
         if token not in TOKENS:
-            await update.message.reply_text(f"❌ Invalid token. Available: {', '.join(TOKENS.keys())}")
+            await update.message.reply_text(f"❌ Invalid token. Use: MATIC or USDT")
             return
         
         if network not in ['testnet', 'mainnet']:
             await update.message.reply_text("❌ Invalid network. Use: testnet or mainnet")
             return
         
-        # In a real bot, you'd resolve the username to user_id
-        seller_id = 123456789  # This should be resolved from username
+        if network == 'testnet' and not account_test:
+            await update.message.reply_text("❌ Testnet not available. Check RPC connection.")
+            return
         
+        if network == 'mainnet' and not account_main:
+            await update.message.reply_text("❌ Mainnet not available. Check RPC connection.")
+            return
+        
+        # Get the appropriate account
+        account = account_test if network == 'testnet' else account_main
+        
+        # Create escrow in database
         escrow_id = db.create_escrow(
             update.effective_chat.id,
             update.effective_user.id,
-            seller_id,
+            seller_username,
             amount,
             token,
-            network,
-            hours
+            network
         )
         
-        # Generate deposit address
-        w3 = w3_test if network == 'testnet' else w3_main
-        bot_account = account_test if network == 'testnet' else account_main
+        # Set deposit address
+        db.set_deposit_address(escrow_id, account.address)
         
-        db.set_buyer_address(escrow_id, bot_account.address)
-        
+        # Create response with buttons
         keyboard = [
             [InlineKeyboardButton("📊 View Escrow", callback_data=f"escrow_detail_{escrow_id}")],
             [InlineKeyboardButton("🛍 Create Another", callback_data="create_escrow")]
@@ -261,187 +343,180 @@ async def create_escrow_command(update: Update, context: ContextTypes.DEFAULT_TY
         
         await update.message.reply_text(
             f"✅ **Escrow Created!**\n\n"
-            f"**ID:** #{escrow_id}\n"
+            f"**ID:** `#{escrow_id}`\n"
+            f"**Amount:** `{amount} {token}`\n"
+            f"**Network:** `{network}`\n"
+            f"**Seller:** `{seller_username}`\n\n"
+            f"💰 **Send {amount} {token} to:**\n"
+            f"`{account.address}`\n\n"
+            f"I'll detect your payment automatically!",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+        
+    except ValueError:
+        await update.message.reply_text("❌ Invalid amount. Please use numbers only.")
+    except Exception as e:
+        logger.error(f"Error creating escrow: {e}")
+        await update.message.reply_text("❌ Error creating escrow. Please try again.")
+
+async def show_my_escrows(query, context):
+    """Show user's escrows"""
+    try:
+        user_id = query.from_user.id
+        escrows = db.get_user_escrows(user_id)
+        
+        if not escrows:
+            keyboard = [[InlineKeyboardButton("🛍 Create First Escrow", callback_data="create_escrow")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                "📭 You have no active escrows.\n\n"
+                "Create your first escrow to get started!",
+                reply_markup=reply_markup
+            )
+            return
+        
+        keyboard = []
+        for escrow in escrows:
+            escrow_id, _, _, seller_username, amount, token, network, state, created_at, _, _, _ = escrow
+            status_emoji = "⏳" if state == "created" else "💰" if state == "buyer_paid" else "✅"
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"{status_emoji} #{escrow_id} - {amount} {token}", 
+                    callback_data=f"escrow_detail_{escrow_id}"
+                )
+            ])
+        
+        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_to_main")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            "📊 **Your Escrows**\n\n"
+            "Select an escrow to view details:",
+            reply_markup=reply_markup
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in show_my_escrows: {e}")
+        await query.edit_message_text("❌ Error loading your escrows.")
+
+async def show_escrow_detail(query, context, escrow_id):
+    """Show detailed escrow information"""
+    try:
+        escrow = db.get_escrow(escrow_id)
+        if not escrow:
+            await query.edit_message_text("❌ Escrow not found.")
+            return
+        
+        (_, chat_id, buyer_id, seller_username, amount, token, network, state, 
+         created_at, expires_at, deposit_address, _) = escrow
+        
+        # Status emojis
+        status_emojis = {
+            'created': '⏳ Waiting for payment',
+            'buyer_paid': '💰 Payment received',
+            'completed': '✅ Completed',
+            'disputed': '🚩 In dispute',
+            'cancelled': '❌ Cancelled'
+        }
+        
+        message_text = (
+            f"📋 **Escrow #{escrow_id}**\n\n"
             f"**Amount:** {amount} {token}\n"
             f"**Network:** {network}\n"
             f"**Seller:** {seller_username}\n"
-            f"**Expires:** {hours} hours\n\n"
-            f"💰 **Send {amount} {token} to:**\n"
-            f"`{bot_account.address}`\n\n"
-            f"I'll automatically detect your payment and notify the seller!",
+            f"**Status:** {status_emojis.get(state, state)}\n"
+            f"**Created:** {created_at}\n"
+        )
+        
+        if deposit_address:
+            message_text += f"\n**Deposit Address:**\n`{deposit_address}`"
+        
+        keyboard = [[InlineKeyboardButton("🔙 Back to List", callback_data="my_escrows")]]
+        
+        # Add action buttons based on state
+        if state == EscrowState.CREATED.value:
+            keyboard.insert(0, [InlineKeyboardButton("🚩 Report Issue", callback_data=f"dispute_{escrow_id}")])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            message_text,
             reply_markup=reply_markup,
             parse_mode='Markdown'
         )
         
     except Exception as e:
-        logger.error(f"Error creating escrow: {e}")
-        await update.message.reply_text("❌ Error creating escrow. Please check the format.")
-
-async def show_my_escrows(query, context):
-    user_id = query.from_user.id
-    escrows = db.get_user_escrows(user_id)
-    
-    if not escrows:
-        await query.edit_message_text("📭 You have no active escrows.")
-        return
-    
-    keyboard = []
-    for escrow in escrows:
-        escrow_id, _, _, _, amount, token, network, state, created_at, _, _, _, _, _, _ = escrow
-        keyboard.append([InlineKeyboardButton(
-            f"#{escrow_id} - {amount} {token} ({state})", 
-            callback_data=f"escrow_detail_{escrow_id}"
-        )])
-    
-    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="start")])
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(
-        "📊 **Your Escrows**\n\n"
-        "Select an escrow to view details:",
-        reply_markup=reply_markup
-    )
-
-async def show_escrow_detail(query, context, escrow_id):
-    escrow = db.get_escrow(escrow_id)
-    if not escrow:
-        await query.edit_message_text("❌ Escrow not found.")
-        return
-    
-    (_, chat_id, buyer_id, seller_id, amount, token, network, state, 
-     created_at, expires_at, buyer_address, seller_address, tx_hash, dispute_reason, _) = escrow
-    
-    keyboard = []
-    
-    if state == EscrowState.BUYER_PAID.value and query.from_user.id == seller_id:
-        keyboard.append([InlineKeyboardButton("✅ Confirm Receipt", callback_data=f"release_{escrow_id}")])
-        keyboard.append([InlineKeyboardButton("🚩 Report Problem", callback_data=f"dispute_{escrow_id}")])
-    
-    elif state == EscrowState.CREATED.value and query.from_user.id == buyer_id:
-        keyboard.append([InlineKeyboardButton("🚩 Cancel Escrow", callback_data=f"dispute_{escrow_id}")])
-    
-    keyboard.append([InlineKeyboardButton("🔙 Back to List", callback_data="my_escrows")])
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    status_emojis = {
-        'created': '⏳',
-        'buyer_paid': '💰',
-        'completed': '✅',
-        'disputed': '🚩',
-        'cancelled': '❌'
-    }
-    
-    await query.edit_message_text(
-        f"📋 **Escrow #{escrow_id}** {status_emojis.get(state, '📄')}\n\n"
-        f"**Amount:** {amount} {token}\n"
-        f"**Network:** {network}\n"
-        f"**Status:** {state.replace('_', ' ').title()}\n"
-        f"**Created:** {created_at}\n"
-        f"**Expires:** {expires_at}\n"
-        f"**Buyer Address:** `{buyer_address}`\n\n"
-        f"{'⚠️ **DISPUTE:** ' + dispute_reason if dispute_reason else ''}",
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
-    )
+        logger.error(f"Error in show_escrow_detail: {e}")
+        await query.edit_message_text("❌ Error loading escrow details.")
 
 async def release_escrow(query, context, escrow_id):
-    escrow = db.get_escrow(escrow_id)
-    if not escrow:
-        await query.edit_message_text("❌ Escrow not found.")
-        return
-    
-    state = escrow[7]
-    if state != EscrowState.BUYER_PAID.value:
-        await query.edit_message_text("❌ Invalid action for current state.")
-        return
-    
-    # In real implementation, transfer funds to seller
-    db.update_escrow_state(escrow_id, EscrowState.COMPLETED)
-    
-    await query.edit_message_text(
-        f"✅ **Escrow #{escrow_id} Completed!**\n\n"
-        f"The funds have been released to the seller.\n"
-        f"Transaction completed successfully."
-    )
+    """Release funds to seller"""
+    try:
+        db.update_escrow_state(escrow_id, EscrowState.COMPLETED)
+        await query.edit_message_text(
+            f"✅ **Escrow #{escrow_id} Completed!**\n\n"
+            f"Funds have been released to the seller.\n"
+            f"Transaction completed successfully."
+        )
+    except Exception as e:
+        logger.error(f"Error releasing escrow: {e}")
+        await query.edit_message_text("❌ Error releasing funds.")
 
 async def start_dispute(query, context, escrow_id):
-    escrow = db.get_escrow(escrow_id)
-    if not escrow:
-        await query.edit_message_text("❌ Escrow not found.")
-        return
-    
-    db.update_escrow_state(escrow_id, EscrowState.DISPUTED)
-    
-    await query.edit_message_text(
-        f"🚩 **Dispute Reported for Escrow #{escrow_id}**\n\n"
-        f"Please describe the issue. An admin will review your case shortly.\n\n"
-        f"Send your dispute reason now:"
-    )
-    context.user_data['awaiting_dispute_reason'] = escrow_id
-
-# --- Payment Detection System ---
-async def detect_payments():
-    """Intelligent payment detection system"""
-    while True:
-        try:
-            # Check testnet and mainnet
-            for network_name, w3, account in [
-                ('testnet', w3_test, account_test),
-                ('mainnet', w3_main, account_main)
-            ]:
-                await check_network_payments(network_name, w3, account)
-            
-            await asyncio.sleep(10)  # Check every 10 seconds
-            
-        except Exception as e:
-            logger.error(f"Payment detection error: {e}")
-            await asyncio.sleep(30)
-
-async def check_network_payments(network_name, w3, account):
+    """Start dispute process"""
     try:
-        latest_block = w3.eth.block_number
-        # Check last 5 blocks for missed transactions
-        for block_num in range(latest_block - 5, latest_block + 1):
-            block = w3.eth.get_block(block_num, full_transactions=True)
-            
-            for tx in block.transactions:
-                if tx['to'] and tx['to'].lower() == account.address.lower():
-                    await handle_incoming_tx(tx, network_name, w3)
-                    
+        db.update_escrow_state(escrow_id, EscrowState.DISPUTED)
+        await query.edit_message_text(
+            f"🚩 **Dispute Opened for Escrow #{escrow_id}**\n\n"
+            f"An admin will review your case shortly.\n"
+            f"Please describe the issue in detail when contacted."
+        )
     except Exception as e:
-        logger.error(f"Error checking {network_name} payments: {e}")
+        logger.error(f"Error starting dispute: {e}")
+        await query.edit_message_text("❌ Error opening dispute.")
 
-async def handle_incoming_tx(tx, network_name, w3):
-    """Handle incoming transaction and match with escrow"""
-    try:
-        value = w3.from_wei(tx['value'], 'ether')
-        from_address = tx['from']
-        
-        logger.info(f"💰 Detected {value} MATIC from {from_address} on {network_name}")
-        
-        # Find matching escrow (in real implementation, match by amount and network)
-        # For now, just log it
-        # You would update escrow state to BUYER_PAID here
-        
-    except Exception as e:
-        logger.error(f"Error handling transaction: {e}")
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check bot status"""
+    status_msg = "🤖 **Bot Status**\n\n"
+    
+    if w3_test and w3_test.is_connected():
+        status_msg += "✅ **Testnet**: Connected\n"
+        if account_test:
+            status_msg += f"   Address: `{account_test.address}`\n"
+    else:
+        status_msg += "❌ **Testnet**: Disconnected\n"
+    
+    if w3_main and w3_main.is_connected():
+        status_msg += "✅ **Mainnet**: Connected\n"
+        if account_main:
+            status_msg += f"   Address: `{account_main.address}`\n"
+    else:
+        status_msg += "❌ **Mainnet**: Disconnected\n"
+    
+    await update.message.reply_text(status_msg, parse_mode='Markdown')
 
-# --- Main Bot Loop ---
+# --- Main Bot Application ---
 async def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    
-    # Add handlers
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("create", create_escrow_command))
-    app.add_handler(CallbackQueryHandler(handle_callback))
-    
-    logger.info("🤖 Starting Intelligent Escrow Bot...")
-    
-    # Start payment detection in background
-    payment_task = asyncio.create_task(detect_payments())
-    
-    # Start Telegram bot
-    await app.run_polling()
+    """Start the bot"""
+    try:
+        # Create application
+        application = ApplicationBuilder().token(BOT_TOKEN).build()
+        
+        # Add handlers
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("create", create_escrow_command))
+        application.add_handler(CommandHandler("status", status_command))
+        application.add_handler(CallbackQueryHandler(button))
+        
+        logger.info("🤖 Starting Escrow Bot...")
+        
+        # Start polling
+        await application.run_polling()
+        
+    except Exception as e:
+        logger.error(f"Failed to start bot: {e}")
 
 if __name__ == "__main__":
+    # Run the bot
     asyncio.run(main())
