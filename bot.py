@@ -1,4 +1,5 @@
 # escrow_bot.py
+print("Bot started!")
 import os
 import logging
 import re
