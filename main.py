@@ -18,6 +18,11 @@ except Exception as e:
 
 # --- Load environment variables ---
 BOT_TOKEN = os.environ.get('BOT_TOKEN', 'your-bot-token-here')
+if TOKEN:
+    TOKEN = TOKEN.strip()
+else:
+    raise ValueError("token missing")
+print(f"Token: {repr(TOKEN)}")
 POLYGON_TEST_PRIVATE_KEY = os.environ.get('BOT_PRIVATE_KEY_TESTNET', 'your-testnet-private-key')
 POLYGON_MAIN_PRIVATE_KEY = os.environ.get('BOT_PRIVATE_KEY_MAINNET', 'your-mainnet-private-key')
 RPC_POLYGON_TEST = os.environ.get('RPC_URL_TESTNET', 'https://rpc-mumbai.maticvigil.com')
